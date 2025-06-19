@@ -179,3 +179,70 @@ missing_values_summary = pd.DataFrame({
 })
 missing_values_summary
 
+# Encode customer_id and article_id
+customer_id_map = {cid: idx for idx, cid in enumerate(customers['customer_id'].unique())}
+article_id_map = {aid: idx for idx, aid in enumerate(articles['article_id'].unique())}
+
+transactions['customer_id'] = transactions['customer_id'].map(customer_id_map)
+transactions['article_id'] = transactions['article_id'].map(article_id_map)
+
+# Temporal Train-Test Split
+transactions['t_dat'] = pd.to_datetime(transactions['t_dat'])
+split_date = transactions['t_dat'].max() - pd.Timedelta(days = 7)
+
+train_data = transactions[transactions['t_dat'] < split_date]
+test_data = transactions[transactions['t_dat'] >= split_date]
+
+# Generate Labels
+train_data['purchased'] = 1
+test_data['purchased'] = 1
+
+# Convert Pandas DataFrames to Dask DataFrames
+transactions_dd = dd.from_pandas(transactions, npartitions=8)
+train_data_dd = dd.from_pandas(train_data, npartitions=8)
+
+# Get unique article IDs as a Dask array for efficient random sampling
+all_article_ids = transactions_dd['article_id'].unique().compute()
+all_article_ids = np.array(all_article_ids)
+
+from scipy.sparse import csr_matrix
+
+# Step 1: Precompute Customer-Item Interaction Matrix
+customer_map = {cid: idx for idx, cid in enumerate(train_data['customer_id'].unique())}
+article_map = {aid: idx for idx, aid in enumerate(train_data['article_id'].unique())}
+
+train_data['customer_idx'] = train_data['customer_id'].map(customer_map)
+train_data['article_idx'] = train_data['article_id'].map(article_map)
+
+num_customers = len(customer_map)
+num_articles = len(article_map)
+
+# Create a sparse matrix for fast lookup
+interaction_matrix = csr_matrix(
+    (np.ones(len(train_data)), (train_data['customer_idx'], train_data['article_idx'])),
+    shape=(num_customers, num_articles)
+)
+print(interaction_matrix)
+
+# Step 2: Generate Negative Samples Efficiently
+def fast_negative_sampling(customer_ids, num_negatives=5):
+    np.random.seed(42)
+    negative_samples = []
+
+    for customer in customer_ids:
+        purchased_articles = interaction_matrix[customer].indices
+        negative_articles = np.setdiff1d(np.arange(num_articles), purchased_articles, assume_unique=True)
+
+        # Fast negative sampling
+        sampled_articles = np.random.choice(negative_articles, num_negatives, replace=False)
+
+        negative_samples.extend([[customer, article, 0] for article in sampled_articles])
+
+    return pd.DataFrame(negative_samples, columns=['customer_idx', 'article_idx', 'purchased'])
+
+ # Step 3: Process in Parallel
+customer_batches = np.array_split(np.arange(num_customers), 16)  # Increase batch size for faster processing
+negative_samples_list = [fast_negative_sampling(batch) for batch in customer_batches]
+
+# Merge Negative Samples
+negative_samples = pd.concat(negative_samples_list)
